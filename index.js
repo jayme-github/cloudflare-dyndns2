@@ -4,13 +4,9 @@
 
 const CF_API_BASEURL = 'https://api.cloudflare.com/client/v4/'
 
-// Ensure defaults are set (if not defined in worker environment)
-if (typeof BASIC_USER !== 'undefined') {
-  const BASIC_USER = 'username'
-}
-
 const IPV4_REGEX = /^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}$/m;
 const IPV6_REGEX = /^(?:(?:[a-fA-F\d]{1,4}:){7}(?:[a-fA-F\d]{1,4}|:)|(?:[a-fA-F\d]{1,4}:){6}(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}|:[a-fA-F\d]{1,4}|:)|(?:[a-fA-F\d]{1,4}:){5}(?::(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}|(?::[a-fA-F\d]{1,4}){1,2}|:)|(?:[a-fA-F\d]{1,4}:){4}(?:(?::[a-fA-F\d]{1,4}){0,1}:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}|(?::[a-fA-F\d]{1,4}){1,3}|:)|(?:[a-fA-F\d]{1,4}:){3}(?:(?::[a-fA-F\d]{1,4}){0,2}:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}|(?::[a-fA-F\d]{1,4}){1,4}|:)|(?:[a-fA-F\d]{1,4}:){2}(?:(?::[a-fA-F\d]{1,4}){0,3}:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}|(?::[a-fA-F\d]{1,4}){1,5}|:)|(?:[a-fA-F\d]{1,4}:){1}(?:(?::[a-fA-F\d]{1,4}){0,4}:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}|(?::[a-fA-F\d]{1,4}){1,6}|:)|(?::(?:(?::[a-fA-F\d]{1,4}){0,5}:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)(?:\\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}|(?::[a-fA-F\d]{1,4}){1,7}|:)))(?:%[0-9a-zA-Z]{1,})?$/m;
+const FQDN_REGEX = /(?=^.{4,253}$)(^((?!-)[a-zA-Z0-9-]{0,62}[a-zA-Z0-9]\.)+[a-zA-Z]{2,63}$)/m;
 
 /**
  * Receives a HTTP request and replies with a response.
@@ -23,7 +19,13 @@ async function handleRequest(request) {
 
   // Only GET requests are supported
   if (request.method !== 'GET') {
-    throw new BadRequestException(request.method + ' not allowed.')
+    return new Response('badrequest', {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain;charset=UTF-8',
+        'Cache-Control': 'no-store',
+      }
+    })
   }
 
   if (url.pathname === '/') {
@@ -71,23 +73,30 @@ async function handleRequest(request) {
     case '/v3/update':
       const hostnames = url.searchParams.get('hostname')
       if (hostnames === null) {
-        throw new BadRequestException('Parameter "hostname" is missing.')
+        return new Response('notfqdn', {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/plain;charset=UTF-8',
+            'Cache-Control': 'no-store',
+          }
+        })
       }
       const newIPs = parseNewIPs(url, request.headers)
       console.log('New IPv4: ' + newIPs['A'])
       console.log('New IPv6: ' + newIPs['AAAA'])
 
-      // zoneID's will be cached here to speed up updates for multiple records
-      // in the same zone.
+      // zoneID's will be cached here to speed up updates for multiple records in the same zone
       let knownZones = {}
       // Speaking messages with some additional context, returned when json param is set
       let jsonMessages = []
-      // overallSuccess is true if there was at least one successful update or one up to date record
-      let overallSuccess = false
-      let good = []
-      let nochg = []
+      // dyndns2 compatible text messages (https://help.dyn.com/remote-access-api/return-codes/)
+      let txtMessages = []
       for (const hostname of hostnames.split(',')) {
-        const zoneName = zoneFromHostname(hostname)
+        if (!FQDN_REGEX.test(hostname)) {
+          txtMessages.push('nofqdn')
+          continue
+        }
+        const zoneName = zoneFromFQDN(hostname)
         console.log('Update for host ' + hostname + ' in zone ' + zoneName)
 
         var zoneID = knownZones[zoneName]
@@ -97,6 +106,8 @@ async function handleRequest(request) {
           var { success, error, zoneID } = await getZoneID(zoneName)
           if (!success) {
             console.log('Error fetching zoneID: ' + error)
+            // Return nohost of zone not found
+            txtMessages.push('nohost')
             continue
           }
           knownZones[zoneName] = zoneID
@@ -107,24 +118,30 @@ async function handleRequest(request) {
         var { success, error, records } = await getRecords(zoneID, hostname)
         if (!success) {
           console.log('Error fetching records: ' + error)
+          // Return internal error on cfAPI error
+          txtMessages.push('911')
           continue
         }
+
+
+        let good = false
+        let nochg = false
+        let dnserr = false
         for (const record of records) {
           console.log(record.type + ' record "' + record.name + '" ID: ' + record.id)
           for (const type of ['A', 'AAAA']) {
             const newIP = newIPs[type]
             if (record.type === type && newIP !== null) {
               if (record.content == newIP) {
-                overallSuccess = true
-                nochg.push(newIP)
+                nochg = true
                 jsonMessages.push(record.type + ' record ' + record.name + ' is up to date since ' + record.modified_on)
               } else {
                 var { success, error } = await patchRecord(record, newIP)
                 if (success) {
-                  overallSuccess = true
-                  good.push(newIP)
+                  good = true
                   jsonMessages.push(record.type + ' record ' + record.name + ' updated with: ' + newIP)
                 } else {
+                  dnserr = true
                   console.log('Error updating ' + record.type + ' ' + record.name + ': ' + error)
                 }
 
@@ -132,9 +149,27 @@ async function handleRequest(request) {
             }
           }
         }
+        // https://help.dyn.com/return-codes/
+        // Return only one line per host (in order of appearance in hostname parameter) in format:
+        // <status> <list of IPs>
+        // IPs separated by comma (in order of appearance in myip parameter).
+        // If at least one record of a host was updates, return status "good".
+        // If we just encounter noops for a host, return status "nochg".
+        // If at leat one error was encountered, return status "dnserr".
+        if (dnserr) {
+          txtMessages.push('dnserr ' + newIPs['ipList'])
+        } else if (good) {
+          txtMessages.push('good ' + newIPs['ipList'])
+        } else if (nochg) {
+          txtMessages.push('nochg ' + newIPs['ipList'])
+        } else {
+          // This should never be reached
+          txtMessages.push('911 ' + newIPs['ipList'])
+        }
       }
+
       if (jsonResponse) {
-        return new Response(JSON.stringify({ success: overallSuccess, errors: [], messages: jsonMessages }), {
+        return new Response(JSON.stringify({ success: good || nochg, errors: [], messages: jsonMessages }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json;charset=UTF-8',
@@ -142,8 +177,7 @@ async function handleRequest(request) {
           }
         })
       } else {
-        const message = [].concat([...new Set(good)].map(function (e) { return 'good ' + e }), [...new Set(nochg)].map(function (e) { return 'nochg ' + e }))
-        return new Response(message.join('\n'), {
+        return new Response(txtMessages.join('\n'), {
           status: 200,
           headers: {
             'Content-Type': 'text/plain;charset=UTF-8',
@@ -269,34 +303,35 @@ async function cfAPI(url, apiKey, init = {}) {
  * @returns {string}
  * @throws {InternalServerErrorException}
  */
-function zoneFromHostname(hostname) {
-  const zone = hostname.substring(hostname.lastIndexOf('.', hostname.lastIndexOf('.') - 1) + 1, hostname.length)
-  if (zone.length == 0) {
-    throw new InternalServerErrorException('Invalid host: ' + hostname)
-  }
-  return zone
+function zoneFromFQDN(hostname) {
+  return hostname.substring(hostname.lastIndexOf('.', hostname.lastIndexOf('.') - 1) + 1, hostname.length)
 }
 /**
  * Parse the desired new IPv4 and/or IPv6 IP.
+ * ipList is returned to keep track of the order of usable IPs for the dyndns2 response
  * @param {URL} url
  * @param {Headers} headers
- * @returns {{ A: string, AAAA: string }}
+ * @returns {{ A: string, AAAA: string, ipList: string }}
  * @throws {InternalServerErrorException}
  */
 function parseNewIPs(url, headers) {
+  let ipList = []
   let newIPv4 = null
   let newIPv6 = null
   const myip = url.searchParams.get('myip')
   if (myip !== null) {
     // myip might contain multiple IPv4/IPv6 IPs, separated by comma.
     // The specs are not clear about what happens when multiple IPs of the same type
-    // are provided. We just use last one of each type.
+    // are provided. We just use first of each type.
+    // FIXME: Should support multiple A/AAAA records
     myip.split(',').forEach(function (ip) {
       if (ip.length == 0) { return };
-      if (IPV4_REGEX.test(ip)) {
+      if (newIPv4 === null && IPV4_REGEX.test(ip)) {
         newIPv4 = ip
-      } else if (IPV6_REGEX.test(ip)) {
+        ipList.push(ip)
+      } else if (newIPv6 === null && IPV6_REGEX.test(ip)) {
         newIPv6 = ip
+        ipList.push(ip)
       }
     })
   }
@@ -307,8 +342,10 @@ function parseNewIPs(url, headers) {
     const cfConnectingIP = headers.get('CF-Connecting-IP')
     if (IPV4_REGEX.test(cfConnectingIP)) {
       newIPv4 = cfConnectingIP
+      ipList.push(cfConnectingIP)
     } else if (IPV6_REGEX.test(cfConnectingIP)) {
       newIPv6 = cfConnectingIP
+      ipList.push(cfConnectingIP)
     }
   }
   if (newIPv6 === null && newIPv4 === null) {
@@ -317,6 +354,7 @@ function parseNewIPs(url, headers) {
   return {
     A: newIPv4,
     AAAA: newIPv6,
+    ipList: ipList.join(','),
   }
 }
 /**
