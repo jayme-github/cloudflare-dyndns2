@@ -89,6 +89,7 @@ async function handleRequest(request) {
       let knownZones = {}
       // Speaking messages with some additional context, returned when json param is set
       let jsonMessages = []
+      let jsonErrors = []
       // dyndns2 compatible text messages (https://help.dyn.com/remote-access-api/return-codes/)
       let txtMessages = []
       for (const hostname of hostnames.split(',')) {
@@ -128,21 +129,22 @@ async function handleRequest(request) {
         let nochg = false
         let dnserr = false
         for (const record of records) {
-          console.log(record.type + ' record "' + record.name + '" ID: ' + record.id)
           for (const type of ['A', 'AAAA']) {
+            console.log(record.type + ' record "' + record.name + '" ID: ' + record.id)
             const newIP = newIPs[type]
             if (record.type === type && newIP !== null) {
               if (record.content == newIP) {
                 nochg = true
                 jsonMessages.push(record.type + ' record ' + record.name + ' is up to date since ' + record.modified_on)
               } else {
-                var { success, error } = await patchRecord(record, newIP)
+                var { success, error } = await patchRecord(record, zoneID, newIP)
                 if (success) {
                   good = true
                   jsonMessages.push(record.type + ' record ' + record.name + ' updated with: ' + newIP)
                 } else {
                   dnserr = true
                   console.log('Error updating ' + record.type + ' ' + record.name + ': ' + error)
+                  jsonErrors.push('Error updating ' + record.type + ' ' + record.name + ': ' + error)
                 }
 
               }
@@ -155,7 +157,7 @@ async function handleRequest(request) {
         // IPs separated by comma (in order of appearance in myip parameter).
         // If at least one record of a host was updates, return status "good".
         // If we just encounter noops for a host, return status "nochg".
-        // If at leat one error was encountered, return status "dnserr".
+        // If at least one error was encountered, return status "dnserr".
         if (dnserr) {
           txtMessages.push('dnserr ' + newIPs['ipList'])
         } else if (good) {
@@ -165,11 +167,13 @@ async function handleRequest(request) {
         } else {
           // This should never be reached
           txtMessages.push('911 ' + newIPs['ipList'])
+          jsonErrors.push('911 ' + newIPs['ipList'])
         }
       }
 
       if (jsonResponse) {
-        return new Response(JSON.stringify({ success: good || nochg, errors: [], messages: jsonMessages }), {
+        let success = jsonErrors.length === 0
+        return new Response(JSON.stringify({ success: success, errors: jsonErrors, messages: jsonMessages }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json;charset=UTF-8',
@@ -199,10 +203,11 @@ async function handleRequest(request) {
 /**
  * Patch a record with a new IP
  * @param {Object} record
+ * @param {string} zoneID
  * @param {string} newIP
  * @returns {{success: boolean, error: string}}
  */
-async function patchRecord(record, newIP) {
+async function patchRecord(record, zoneID, newIP) {
   console.log('Updating ' + record.type + ' record ' + record.name + ' with: ' + newIP)
   const init = {
     method: 'PATCH',
@@ -210,7 +215,7 @@ async function patchRecord(record, newIP) {
       content: newIP,
     }),
   }
-  const result = await cfAPI('zones/' + record.zone_id + '/dns_records/' + record.id, CF_DNS_API_TOKEN, init)
+  const result = await cfAPI('zones/' + zoneID + '/dns_records/' + record.id, CF_DNS_API_TOKEN, init)
   if (!result.success) {
     return {
       success: result.success,
@@ -427,6 +432,7 @@ function InternalServerErrorException(reason) {
 addEventListener('fetch', event => {
   event.respondWith(
     handleRequest(event.request).catch(err => {
+      console.log('handleRequest failed:', err)
       const json = JSON.stringify(err.reason || { success: false, errors: ['Unknown Error'], messages: [] })
 
       return new Response(json, {
@@ -437,7 +443,7 @@ addEventListener('fetch', event => {
           // Disables caching by default.
           'Cache-Control': 'no-store',
           // Returns the "Content-Length" header for HTTP HEAD requests.
-          'Content-Length': json.length,
+          'Content-Length': json.length.toString(),
         }
       })
     })
